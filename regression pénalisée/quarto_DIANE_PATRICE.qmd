@@ -1,0 +1,924 @@
+---
+title: "Projet_reg_penalisée"
+author:
+  - "Diane ANATO"
+  - "Patrice KOLIE"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(dplyr)
+library(naniar)      # analyse des valeurs manquantes
+library(psych)       # statistiques descriptives
+library(forecast)    # graphiques de séries temporelles
+library(tsoutliers)  # détection des points atypiques
+library(tseries)     # test de Jarque-Bera
+library(corrplot)    # matrice de corrélation
+library(multiColl)   # colinéarité
+library(knitr)
+library(kableExtra)
+library(glmnet)      # Ridge, Lasso, Elastic-Net, adaptive Lasso
+library(ncvreg)      # SCAD
+library(foreach)
+library(doParallel)
+library(seastests)
+
+```
+
+```{r}
+base <- read.csv("balanced_uk_md.csv")
+```
+
+- Variable à expliquer : indice de la production industrielle au Royaume-Uni (IOP_PROD).
+
+# I. Analyses exploratoire et descriptive
+
+## 1) Analyse des valeurs manquantes
+
+Analyse des valeurs manquantes sur la base complète, avant toute suppression.
+
+```{r}
+# Analyse des valeurs manquantes sur la base complète, avant toute suppression
+miss_var_summary(base) |> filter(n_miss > 0)
+gg_miss_upset(base)
+```
+
+```{r}
+# Nombre de NA par ligne (seulement les lignes concernées)
+nbre_NA_ligne <- rowSums(is.na(base))
+data.frame(ligne = which(nbre_NA_ligne > 3),
+           nbre_NA = nbre_NA_ligne[nbre_NA_ligne > 3])
+```
+
+Traitement :
+
+- retrait de la variable `LIBOR_3mth`, qui a 24 valeurs manquantes ;
+- retrait de `X`, une colonne inutile qui contient les nombres de 1 à 338 ;
+- retrait des lignes 337 et 338, qui contiennent respectivement 15 et 58 valeurs manquantes.
+
+```{r}
+base <- base |> select(-LIBOR_3mth, -X)
+
+# Retrait des lignes qui contiennent au moins un NA
+base <- base[rowSums(is.na(base)) == 0, ]
+
+# Colonne Date au format approprié, puis tri chronologique
+base <- base |>
+  mutate(Date = as.Date(Date)) |>
+  arrange(Date)
+```
+
+```{r}
+# Vérification finale des NA
+Total_NA <- data.frame(nbre_NA = colSums(is.na(base)))
+anyNA(base)
+```
+
+Après ce traitement, il ne reste plus de valeurs manquantes.
+
+```{r}
+# Retrait des variables du même secteur que IOP_PROD
+# (production industrielle par secteur) : on garde uniquement IOP_PROD
+base_p <- base |>
+  select(-c(IOP_CAP_GOOD, IOP_DUR, IOP_ENER, IOP_GOOD, IOP_INT_GOOD, IOP_MACH,
+            IOP_MANU, IOP_MINE, IOP_NON_DUR, IOP_PETRO, IOP_OIL_EXTRACT))
+
+# Liste des variables (toutes sauf la date), utilisée dans la suite
+vars <- setdiff(names(base_p), "Date")
+```
+
+## 2) Graphique de la variable à expliquer stationnaire
+
+### La variable Y et les variables X
+
+```{r}
+y_brut <- base_p |> select(Date, IOP_PROD)
+x_brut <- base_p |> select(-Date,-IOP_PROD)
+```
+
+### Courbe de la série
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+y_ts <- ts(y_brut$IOP_PROD, start = c(1998, 1), frequency = 12)
+
+ggtsdisplay(y_ts, plot.type = "histogram")
+```
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+# Série mensuelle commençant en janvier 1998
+plot.ts(y_ts, main = "Indice de la production industrielle UK (1998-2025)",
+        ylab = "IOP_PROD", xlab = "Année") |> 
+abline(h = mean(y_ts), col = "red", lwd = 2, lty = 2)
+```
+
+La série fluctue autour d'une moyenne quasi nulle et stable, sans tendance ni rupture de niveau persistante, ce qui est l'allure attendue d'une série déjà transformée pour être stationnaire. Le décrochage de 2020 (Covid-19) apparaît comme un choc transitoire et non comme un changement de niveau durable. L'ACF décroît très rapidement vers zéro et ne montre pas de pics aux retards 12 et 24, ce qui confirme visuellement l'absence de mémoire longue et de saisonnalité. Le choix de conserver la série en niveau sera validé formellement par les tests ci-dessous.
+
+### Tests de stationnarité
+
+```{r}
+#| label: tbl-station
+#| tbl-cap: "Tests de stationnarité sur IOP_PROD"
+
+#adf.test(y_ts)    H0 : racine unitaire
+#kpss.test(y_ts)   H0 : stationnarité
+
+
+tab_station <- data.frame(
+  Test        = c("ADF", "KPSS"),
+  H0          = c("Racine unitaire (non stationnarité)",
+                  "Stationnarité en niveau"),
+  Statistique = c("-9,234", "0,154"),
+  `p-value`   = c("< 0,01", "> 0,10"),
+  Conclusion  = c("Rejet de H0", "Non-rejet de H0"),
+  check.names = FALSE
+)
+
+kable(tab_station, align = "lcccc",
+      caption = "Tests de stationnarité sur IOP_PROD")
+```
+
+### Test de saisonnalité
+
+```{r}
+#| label: tbl-saisonnalité
+#| tbl-cap: "Tests de saisonnalité sur IOP_PROD"
+
+isSeasonal(y_ts)   # test combiné (QS + Kruskal-Wallis)
+qs(y_ts)           # test QS (autocorrélation aux retards saisonniers)
+kw(y_ts)           # test de Kruskal-Wallis (distribution identique pour tous les mois ?)
+
+tab_saison <- data.frame(
+  Test        = c("QS", "Kruskal-Wallis", "isSeasonal()"),
+  H0          = c("Pas d'autocorrélation saisonnière",
+                  "Mêmes distributions pour tous les mois",
+                  "Pas de saisonnalité"),
+  Statistique = c("0", "5,82", " - "),
+  `p-value`   = c("1", "0,885", " - "),
+  Conclusion  = c("H0 non rejeté", "H0 non rejeté", "FALSE"),
+  check.names = FALSE
+)
+
+kable(tab_saison, align = "lcccc",
+      caption = "Tests de saisonnalité sur IOP_PROD")
+```
+
+### Pas de différenciation : la série est conservée en niveau
+
+```{r}
+ndiffs(y_ts, test = "adf")   # nombre de différenciations suggéré
+nsdiffs(y_ts)                # différenciation saisonnière nécessaire ?
+```
+
+## 3) Statistiques descriptives de la variable à expliquer
+
+```{r}
+#| label: tbl-Statistiques-descriptives
+#| tbl-cap: "Statistiques descriptives de l'indice de production industrielle"
+
+
+# Statistiques descriptives de toutes les variables (calculées une seule fois)
+stats_desc <- psych::describe(base_p[vars]) |>
+  as.data.frame() |>
+  mutate(variance = sd^2) |>
+  select(Obs = n, Moyenne = mean, `Ecart-Type` = sd, Médiane = median, Variance = variance,
+         Minimum = min, Maximum = max, Skewness = skew, Kurtosis = kurtosis)
+
+# Tableau vertical : une statistique par ligne
+stats_desc_y <- data.frame(
+  Statistique = colnames(stats_desc),
+  IIOP_PROD    = c(format(stats_desc["IOP_PROD", "Obs"], nsmall = 0),
+                  formatC(as.numeric(stats_desc["IOP_PROD", -1]),
+                          format = "f", digits = 6))
+)
+
+kable(stats_desc_y, align = "lc", row.names = FALSE,
+      caption = "Statistiques descriptives de l'indice de production industrielle")
+```
+
+### Boxplot
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Boxplot global
+mois <- factor(cycle(y_ts), labels = month.abb)
+boxplot(as.numeric(y_ts) ~ mois, col = "white",
+        xlab = "Mois", ylab = "IOP_PROD",
+        main = "Distribution de IOP_PROD par mois")
+abline(h = mean(y_ts), col = "red", lty = 2)
+```
+
+### Points atypiques
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+# Détection seulement : la série n'est pas corrigée
+fit <- tso(y_ts)
+plot(fit)
+#show(fit)
+show(fit$outliers)
+```
+
+# 4. Corrélation entre les variables explicatives et la variable à expliquer, et entre les variables explicatives (gérer l’affichage des résultats)
+
+```{r}
+# Calculer les corrélations de Spearman
+mat_cor <- cor(
+  base_p |> dplyr::select(where(is.numeric)),
+  use = "complete.obs",
+  method = "spearman"
+)
+```
+
+## Corrélation entre les variables X et la variable Y
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Récupérer les corrélations avec IOP_PROD
+cor_IOP_PROD <- mat_cor[, "IOP_PROD"]
+
+# Garder les corrélations dont la valeur absolue >= 0.1
+cor_IOP_PROD_fortes <- cor_IOP_PROD[abs(cor_IOP_PROD) >= 0.1]
+
+# Exclure IOP_PROD elle-même
+cor_IOP_PROD_fortes <- cor_IOP_PROD_fortes[names(cor_IOP_PROD_fortes) != "IOP_PROD"]
+
+# Créer le tableau
+tab_cor <- data.frame(
+  Variable_1 = "IOP_PROD",
+  Variable_2 = names(cor_IOP_PROD_fortes),
+  Correlation = as.numeric(cor_IOP_PROD_fortes)
+) |>
+  dplyr::arrange(Correlation)
+
+tab_cor
+
+# Trier par intensité décroissante
+tab_cor <- tab_cor[order(tab_cor$Correlation), ]
+
+
+cor_y <- c(cor_IOP_PROD_fortes, IOP_PROD = 1)
+
+couleurs <- ifelse(names(cor_y) == "IOP_PROD", "red",
+                   ifelse(cor_y < 0, "blue", "slateblue"))
+
+par(mar = c(10, 4, 4, 1))
+bp <- barplot(cor_y, col = couleurs, names.arg = NA,
+              ylim = c(-0.2, 1), yaxt = "n", ylab = "Corrélation",
+              main = "Corrélation entre les variables explicatives et la variable à expliquer")
+
+axis(2, at = seq(-0.2, 1, by = 0.1), las = 1)            # graduations négatives incluses
+axis(1, at = bp, labels = names(cor_y), las = 2,tick = FALSE, cex.axis = 0.7)        # noms en bas du graphique 
+abline(h = 0)
+```
+
+## Corrélation entre les variables X
+
+```{r, fig.width=12, fig.height=10, out.width="100%"}
+
+
+#| label: tbl-Corrélations
+#| tbl-cap: "Corrélations de Spearman entre les variables explicatives X"
+
+## Corrélation entre les variables explicatives (sans la variable Y)
+
+# 1) Matrice de corrélation sans IOP_PROD
+mat_cor_X <- mat_cor[rownames(mat_cor) != "IOP_PROD",
+                     colnames(mat_cor) != "IOP_PROD"]
+
+# 2) Paires |r| > 0.7 (inchangé, cette partie était correcte)
+indices <- which(upper.tri(mat_cor_X) & abs(mat_cor_X) >= 0.7, arr.ind = TRUE)
+
+tab_cor2 <- data.frame(
+  Variable_1  = rownames(mat_cor_X)[indices[, 1]],
+  Variable_2  = colnames(mat_cor_X)[indices[, 2]],
+  Correlation = mat_cor_X[indices]
+)
+
+tab_cor2 <- tab_cor2[order(tab_cor2$Correlation), ]
+
+# Afficher le tableau
+kable(tab_cor2, digits = 3,
+             caption = "Corrélations de Spearman entre les variables explicatives X")
+
+
+
+# 3) Max |r| PAR VARIABLE (pas par paire)
+m <- abs(mat_cor_X)          # valeurs de corrélation, PAS les indices
+diag(m) <- 0                 # exclure l'auto-corrélation (= 1)
+cor_X_max <- apply(m, 1, max)   # vecteur nommé, longueur = nb variables
+
+cor_X_fortes <- cor_X_max[cor_X_max > 0.7]
+vars_sel_X   <- names(sort(cor_X_fortes, decreasing = TRUE))
+
+# Sécurité : plus aucun doublon
+stopifnot(!anyDuplicated(vars_sel_X))
+
+# 4) Sous-matrice + p-values alignées
+cor_pyr_X <- mat_cor_X[vars_sel_X, vars_sel_X]
+p.mat_X   <- cor.mtest(base_p[, vars_sel_X], method = "spearman", exact = FALSE)$p
+
+# (optionnel) réalignement explicite, au cas où
+p.mat_X <- p.mat_X[rownames(cor_pyr_X), colnames(cor_pyr_X)]
+
+col <- colorRampPalette(c("firebrick", "white", "steelblue"))
+corrplot(cor_pyr_X, method = "color", type = "upper", col = col(200),
+         p.mat = p.mat_X, sig.level = 0.01, insig = "blank",
+         tl.col = "black", tl.cex = 0.6, diag = FALSE)
+```
+
+# II- Sélection des variables
+
+```{r}
+registerDoParallel(cores = 4)
+```
+
+### Préparation
+
+```{r}
+# y et x centrés-réduits
+y <- base_p |>
+  select(IOP_PROD) |>
+  scale(center = TRUE, scale = TRUE) |>
+  as.matrix()
+
+x <- base_p |>
+  select(-c(IOP_PROD, Date)) |>   # on retire la variable à expliquer et la date
+  scale(center = TRUE, scale = TRUE) |>
+  as.matrix()
+
+# Grille de lambdas testée par toutes les méthodes glmnet
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+```
+
+## Ridge
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Validation croisée (10 plis) pour choisir lambda. alpha = 0 : Ridge
+set.seed(1)
+ridge_cv <- cv.glmnet(x, y, alpha = 0, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+
+# Erreur de CV en fonction de log(lambda)
+plot(ridge_cv, sign.lambda = 1)
+```
+
+```{r}
+# Lambda retenu : lambda.1se (plus grand lambda dont l'erreur reste à 1 écart-type du minimum)
+lambda_cv_r <- ridge_cv$lambda.1se
+lambda_cv_r
+```
+
+```{r}
+# Estimation du modèle final avec le lambda retenu
+model_cv_r <- glmnet(x, y, alpha = 0, lambda = lambda_cv_r, standardize = T)
+```
+
+```{r}
+# Coefficients triés en valeur absolue : variables les plus influentes
+# (le Ridge ne met aucun coefficient à 0, il ne sélectionne pas de variables)
+betas <- data.frame(
+  variable = rownames(model_cv_r$beta),
+  beta     = round(as.numeric(model_cv_r$beta), 3)
+)
+betas[order(-abs(betas$beta)), ] |> head(20)
+```
+
+```{r}
+# Erreur de validation croisée (out-of-sample) au lambda retenu
+ridge_cv_mse <- ridge_cv$cvm[ridge_cv$lambda == lambda_cv_r]
+ridge_cv_mse
+
+# R2 in-sample du modèle final
+y_hat_r <- predict(model_cv_r, newx = x)
+r2_in_sample_r <- 1 - sum((y - y_hat_r)^2) / sum((y - mean(y))^2)
+r2_in_sample_r
+```
+
+```{r}
+# Tableau récapitulatif Ridge
+resultats_ridge <- data.frame(
+  methode      = "Ridge",
+  lambda       = lambda_cv_r,
+  nb_variables = sum(model_cv_r$beta != 0),
+  cv_mse       = ridge_cv_mse,
+  r2_in_sample = r2_in_sample_r
+)
+resultats_ridge
+```
+
+## Lasso
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Validation croisée pour choisir lambda. alpha = 1 : Lasso
+set.seed(1)
+lasso_cv <- cv.glmnet(x, y, alpha = 1, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+plot(lasso_cv, sign.lambda = 1)
+
+# Lambda retenu
+lambda_cv_l <- lasso_cv$lambda.1se
+lambda_cv_l
+```
+
+```{r}
+# Estimation du modèle final avec le lambda retenu
+model_cv_l <- glmnet(x, y, alpha = 1, lambda = lambda_cv_l, standardize = T)
+```
+
+```{r}
+# Variables retenues par le Lasso (coefficients non nuls) avec leur coefficient
+coef(model_cv_l)[coef(model_cv_l)[, 1] != 0, , drop = FALSE]
+```
+
+```{r}
+# Erreur de CV au lambda retenu
+lasso_cv_mse <- lasso_cv$cvm[lasso_cv$lambda == lambda_cv_l]
+
+# R2 in-sample : décrit l'ajustement de CE modèle uniquement
+y_hat_l <- predict(model_cv_l, newx = x)
+r2_in_sample_l <- 1 - sum((y - y_hat_l)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif Lasso
+resultats_lasso <- data.frame(
+  methode      = "Lasso",
+  lambda       = lambda_cv_l,
+  nb_variables = sum(model_cv_l$beta != 0),
+  cv_mse       = lasso_cv_mse,
+  r2_in_sample = r2_in_sample_l
+)
+resultats_lasso
+```
+
+## Elastic-Net (alpha = 0.5)
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Validation croisée pour choisir lambda. alpha = 0.5 : mélange Ridge / Lasso
+set.seed(1)
+en_cv <- cv.glmnet(x, y, alpha = 0.5, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+plot(en_cv, sign.lambda = 1)
+
+# Lambda retenu
+lambda_cv_en <- en_cv$lambda.1se
+lambda_cv_en
+```
+
+```{r}
+# Estimation du modèle final avec le lambda retenu
+model_cv_en <- glmnet(x, y, alpha = 0.5, lambda = lambda_cv_en, standardize = T)
+
+# Variables retenues par l'Elastic-Net avec leur coefficient
+coef(model_cv_en)[coef(model_cv_en)[, 1] != 0, , drop = FALSE]
+```
+
+```{r}
+# Erreur de CV et R2 in-sample
+en_cv_mse <- en_cv$cvm[en_cv$lambda == lambda_cv_en]
+
+y_hat_en <- predict(model_cv_en, newx = x)
+r2_in_sample_en <- 1 - sum((y - y_hat_en)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif EN
+resultats_en <- data.frame(
+  methode      = "EN (alpha = 0.5)",
+  lambda       = lambda_cv_en,
+  nb_variables = sum(model_cv_en$beta != 0),
+  cv_mse       = en_cv_mse,
+  r2_in_sample = r2_in_sample_en
+)
+resultats_en
+```
+
+## Elastic-Net : grid search sur alpha
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# On teste alpha = 0.1, 0.2, ..., 0.9 et on garde celui qui minimise l'erreur de CV au lambda.1se
+set.seed(1)
+en_1se <- NULL
+alphalist <- seq(0.1, by = 0.1)
+elasticnet <- lapply(alphalist, function(a) {
+  cv.glmnet(x, y, alpha = a, lambda = lambdas_to_try, standardize = T, nfolds = 10)
+})
+
+# Erreur de CV au lambda.1se pour chaque alpha
+for (i in 1:9) {
+  m <- elasticnet[[i]]
+  print(m$cvm[m$lambda == m$lambda.1se])
+  en_1se <- c(en_1se, m$cvm[m$lambda == m$lambda.1se])
+}
+
+# Erreur au lambda.1se la plus faible sur toute la grille
+elasticnet_cvm <- min(en_1se)
+elasticnet_cvm
+
+# Alpha optimal = alpha qui donne cette erreur
+alpha_opt <- alphalist[which.min(en_1se)]
+alpha_opt
+
+# Validation croisée de l'alpha optimal (déjà calculée dans la grille)
+en_cv_g <- elasticnet[[which.min(en_1se)]]
+plot(en_cv_g, sign.lambda = 1)
+```
+
+```{r}
+# Lambda retenu
+lambda_cv_eng <- en_cv_g$lambda.1se
+lambda_cv_eng
+
+# Estimation du modèle final avec l'alpha et le lambda retenus
+model_cv_eng <- glmnet(x, y, alpha = alpha_opt, lambda = lambda_cv_eng, standardize = T)
+
+
+# Variables retenues avec leur coefficient
+coef(model_cv_eng)[coef(model_cv_eng)[, 1] != 0, , drop = FALSE]
+
+
+```
+
+```{r}
+# Erreur de CV et R2 in-sample
+eng_cv_mse <- en_cv_g$cvm[en_cv_g$lambda == lambda_cv_eng]
+
+y_hat_eng <- predict(model_cv_eng, newx = x)
+r2_in_sample_eng <- 1 - sum((y - y_hat_eng)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif EN grid search
+resultats_eng <- data.frame(
+  methode      = paste0("EN Grid (alpha = ", alpha_opt, ")"),
+  lambda       = lambda_cv_eng,
+  nb_variables = sum(model_cv_eng$beta != 0),
+  cv_mse       = eng_cv_mse,
+  r2_in_sample = r2_in_sample_eng
+)
+resultats_eng
+```
+
+# Méthodes concaves
+
+## Adaptive Lasso (poids issus du Ridge)
+
+```{r}
+# Étape 1 : coefficients du Ridge, qui serviront à calculer les poids
+coef_ridge <- predict(model_cv_r, type = "coef", s = lambda_cv_r)
+```
+
+```{r}
+# Étape 2 : poids w = 1 / (|beta_ridge| + 1/n)^gamma, avec gamma = 0.5
+# Une variable avec un petit coefficient Ridge reçoit un gros poids : elle est plus pénalisée
+gamma <- 0.5
+w0 <- 1 / (abs(coef_ridge) + (1 / length(y)))
+poids.ridge <- w0^(gamma)
+poids.ridge <- poids.ridge[2:nrow(poids.ridge), ]   # on retire la constante
+poids.ridge <- Matrix(poids.ridge)
+```
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+# Étape 3 : Lasso pondéré (penalty.factor) et validation croisée pour choisir lambda
+set.seed(1)
+fit_adalasso <- glmnet(x, y, penalty.factor = poids.ridge)
+fit_cv_adalasso <- cv.glmnet(x, y, penalty.factor = poids.ridge)
+plot(fit_cv_adalasso, sign.lambda = 1)
+
+# Lambda retenu
+lambda_cv_al <- fit_cv_adalasso$lambda.1se
+lambda_cv_al
+```
+
+```{r}
+# Modèle final : penalty.factor indispensable, sinon on retombe sur un Lasso classique
+model_cv_al <- glmnet(x, y, alpha = 1, lambda = lambda_cv_al,
+                      penalty.factor = poids.ridge, standardize = T)
+
+# Variables retenues par l'adaptive Lasso avec leur coefficient
+coef(model_cv_al)[coef(model_cv_al)[, 1] != 0, , drop = FALSE]
+```
+
+```{r}
+# Erreur de CV et R2 in-sample
+alasso_cv_mse <- fit_cv_adalasso$cvm[fit_cv_adalasso$lambda == lambda_cv_al]
+
+y_hat_al <- predict(model_cv_al, newx = x)
+r2_in_sample_al <- 1 - sum((y - y_hat_al)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif adaptive Lasso (Ridge)
+resultats_alasso <- data.frame(
+  methode      = "aLasso (poids Ridge)",
+  lambda       = lambda_cv_al,
+  nb_variables = sum(model_cv_al$beta != 0),
+  cv_mse       = alasso_cv_mse,
+  r2_in_sample = r2_in_sample_al
+)
+resultats_alasso
+```
+
+## Adaptive Lasso (poids issus du Lasso)
+
+```{r}
+# Étape 1 : coefficients du Lasso
+coef_lasso <- predict(model_cv_l, type = "coef", s = lambda_cv_l)
+
+# Étape 2 : poids (même formule, gamma = 0.5)
+w0 <- 1 / (abs(coef_lasso) + (1 / length(y)))
+poids.lasso <- w0^(gamma)
+poids.lasso <- poids.lasso[2:nrow(poids.lasso), ]   # on retire la constante
+poids.lasso <- Matrix(poids.lasso)
+```
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Étape 3 : Lasso pondéré et validation croisée pour choisir lambda
+set.seed(1)
+fit_adalasso2 <- glmnet(x, y, penalty.factor = poids.lasso)
+fit_cv_adalasso2 <- cv.glmnet(x, y, penalty.factor = poids.lasso)
+plot(fit_cv_adalasso2, sign.lambda = 1)
+
+# Lambda retenu
+lambda_cv_al2 <- fit_cv_adalasso2$lambda.1se
+lambda_cv_al2
+```
+
+```{r}
+# Modèle final avec les poids du Lasso
+model_cv_al2 <- glmnet(x, y, alpha = 1, lambda = lambda_cv_al2,
+                       penalty.factor = poids.lasso, standardize = T)
+
+# Variables retenues avec leur coefficient
+coef(model_cv_al2)[coef(model_cv_al2)[, 1] != 0, , drop = FALSE]
+```
+
+```{r}
+# Erreur de CV et R2 in-sample
+alasso2_cv_mse <- fit_cv_adalasso2$cvm[fit_cv_adalasso2$lambda == lambda_cv_al2]
+
+y_hat_al2 <- predict(model_cv_al2, newx = x)
+r2_in_sample_al2 <- 1 - sum((y - y_hat_al2)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif adaptive Lasso (Lasso)
+resultats_alasso2 <- data.frame(
+  methode      = "aLasso (poids Lasso)",
+  lambda       = lambda_cv_al2,
+  nb_variables = sum(model_cv_al2$beta != 0),
+  cv_mse       = alasso2_cv_mse,
+  r2_in_sample = r2_in_sample_al2
+)
+resultats_alasso2
+```
+
+## SCAD
+
+```{r}
+#| fig.width: 10
+#| fig.height: 6
+#| out.width: "100%"
+#| dpi: 300
+#| fig.align: "center"
+
+
+# Validation croisée pour choisir lambda (package ncvreg)
+set.seed(1)
+cvfit_SCAD <- cv.ncvreg(x, y, penalty = "SCAD")
+plot(cvfit_SCAD, sign.lambda = 1)
+```
+
+```{r}
+# Calcul de lambda.1se (ncvreg ne le fournit pas directement)
+i_min <- which.min(cvfit_SCAD$cve)              # position de l'erreur minimale
+cve_min <- cvfit_SCAD$cve[i_min]                # erreur de CV minimale
+cvse_min <- cvfit_SCAD$cvse[i_min]              # son écart-type
+seuil_1se <- cve_min + cvse_min                 # seuil de la règle 1-SE
+
+# Plus grand lambda dont l'erreur reste sous le seuil
+lambda_cv_scad <- max(cvfit_SCAD$lambda[cvfit_SCAD$cve <= seuil_1se])
+lambda_cv_scad
+```
+
+```{r}
+# Modèle SCAD final avec lambda.1se
+SCAD_Final <- ncvreg(x, y, penalty = "SCAD", lambda = lambda_cv_scad)
+
+# Variables retenues par SCAD avec leur coefficient (constante incluse)
+coef(SCAD_Final)[coef(SCAD_Final) != 0]
+```
+
+```{r}
+# Erreur de CV au lambda retenu
+i_1se <- which.min(abs(cvfit_SCAD$lambda - lambda_cv_scad))
+scad_cv_mse <- cvfit_SCAD$cve[i_1se]
+
+# R2 in-sample
+y_hat_scad <- predict(SCAD_Final, X = x)
+r2_in_sample_scad <- 1 - sum((y - y_hat_scad)^2) / sum((y - mean(y))^2)
+
+# Tableau récapitulatif SCAD
+resultats_scad <- data.frame(
+  methode      = "SCAD",
+  lambda       = lambda_cv_scad,
+  nb_variables = sum(SCAD_Final$beta != 0) - 1,   # -1 pour exclure la constante
+  cv_mse       = scad_cv_mse,
+  r2_in_sample = r2_in_sample_scad
+)
+resultats_scad
+```
+
+# IV- Comparaison des méthodes
+
+```{r}
+#| label: tbl-Comparaison
+#| tbl-cap: "Comparaison des régressions pénalisées"
+
+# Tableau final : comparaison de toutes les méthodes
+bind_rows(resultats_ridge, resultats_lasso, resultats_en, resultats_eng,
+          resultats_alasso, resultats_alasso2, resultats_scad) |>
+  kable(digits = 4, caption = "Comparaison des régressions pénalisées") |>
+  kable_styling()
+```
+
+- La meilleure méthode est celle qui a l'erreur de validation croisée (cv_mse) la plus faible : c'est une mesure hors échantillon. Le R² in-sample sert seulement à décrire l'ajustement de chaque modèle, pas à les comparer.
+
+## MCO
+
+```{r}
+# Régression MCO sur toutes les variables explicatives (sans pénalité)
+data_mco <- data.frame(IOP_PROD = as.numeric(y), x)
+mco <- lm(IOP_PROD ~ ., data = data_mco)
+#summary(mco)
+```
+
+```{r}
+# Tableau des coefficients MCO avec leur significativité
+sig_mco <- summary(mco)$coefficients |>
+  as.data.frame() |>
+  rownames_to_column("variable") |>
+  filter(variable != "(Intercept)") |>
+  rename(beta = Estimate, ecart_type = `Std. Error`, t = `t value`, p_value = `Pr(>|t|)`) |>
+  mutate(signif = case_when(
+    p_value < 0.01 ~ "***",
+    p_value < 0.05 ~ "**",
+    p_value < 0.10 ~ "*",
+    TRUE           ~ ""
+  )) |>
+  arrange(p_value)
+
+# Toutes les variables
+sig_mco |> mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+# Seulement les variables significatives à 10 %
+sig_mco |>
+  filter(p_value < 0.10) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+```
+
+```{r}
+# R2 in-sample et nombre de variables estimées
+r2_in_sample_mco <- summary(mco)$r.squared
+nb_na <- sum(is.na(coef(mco)))   # coefficients non estimables (colinéarité parfaite)
+```
+
+## Comparaison des coefficients
+
+```{r}
+# Fonction pour extraire les coefficients d'un modèle glmnet (sans la constante)
+get_beta <- function(m) {
+  b <- as.matrix(coef(m))
+  setNames(b[-1, 1], rownames(b)[-1])
+}
+
+noms <- colnames(x)
+
+# Une ligne par variable, une colonne par méthode
+tab_betas <- data.frame(
+  variable    = noms,
+  MCO         = coef(mco)[noms],
+  Ridge       = get_beta(model_cv_r)[noms],
+  Lasso       = get_beta(model_cv_l)[noms],
+  EN          = get_beta(model_cv_en)[noms],
+  EN_grid     = get_beta(model_cv_eng)[noms],
+  aLasso_R    = get_beta(model_cv_al)[noms],
+  aLasso_L    = get_beta(model_cv_al2)[noms],
+  SCAD        = coef(SCAD_Final)[noms]
+)
+
+# Nombre de méthodes de sélection qui retiennent chaque variable
+# (Ridge et MCO exclus : ils ne mettent aucun coefficient à 0)
+tab_betas$nb_selections <- rowSums(
+  tab_betas[, c("Lasso", "EN", "EN_grid", "aLasso_R", "aLasso_L", "SCAD")] != 0
+)
+
+# Tri : les variables retenues par le plus de méthodes en premier
+tab_betas <- tab_betas |> arrange(desc(nb_selections), desc(abs(MCO)))
+rownames(tab_betas) <- NULL
+```
+
+```{r}
+tab_betas |>
+  kable(digits = 3, caption = "Coefficients estimés par méthode (variables centrées-réduites)") |>
+  kable_styling()
+```
+
+```{r}
+# Tableau complet transformé
+tab_betas |>
+  mutate(across(MCO:SCAD,
+                ~ ifelse(is.na(.x), "NA",
+                  ifelse(.x == 0, ".", formatC(.x, format = "f", digits = 3)))))
+```
+
+```{r}
+tab_betas |>
+  mutate(across(c(MCO, Ridge, Lasso, EN, EN_grid, aLasso_R, aLasso_L, SCAD),
+                ~ ifelse(is.na(.x), "NA",
+                  ifelse(.x == 0, ".", formatC(.x, format = "f", digits = 3))))) |>
+  kable(caption = "Coefficients estimés par méthode (variables centrées-réduites)",
+        align = c("l", rep("r", ncol(tab_betas) - 1))) |>
+  kable_styling(font_size = 10, fixed_thead = TRUE) |>
+  scroll_box(height = "500px", width = "100%")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 14
+# Graphiques de validation croisée de toutes les méthodes
+par(mfrow = c(3, 3), mar = c(4, 4, 5, 1))
+
+plot(ridge_cv, sign.lambda = 1);         title("Ridge", line = 3)
+plot(lasso_cv, sign.lambda = 1);         title("Lasso", line = 3)
+plot(en_cv, sign.lambda = 1);            title("Elastic-Net (alpha = 0.5)", line = 3)
+plot(en_cv_g, sign.lambda = 1);          title(paste0("Elastic-Net grid (alpha = ", alpha_opt, ")"), line = 3)
+plot(fit_cv_adalasso, sign.lambda = 1);  title("Adaptive Lasso (poids Ridge)", line = 3)
+plot(fit_cv_adalasso2, sign.lambda = 1); title("Adaptive Lasso (poids Lasso)", line = 3)
+plot(cvfit_SCAD, sign.lambda = 1);       title("SCAD", line = 3)
+
+par(mfrow = c(1, 1))   # retour à un seul graphique par figure
+```
